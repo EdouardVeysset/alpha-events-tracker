@@ -18,7 +18,12 @@
         .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(212, 165, 116, 0.3); }
         .btn-secondary { background: rgba(255,255,255,0.2); color: white; border: 2px solid white; }
         .btn-secondary:hover { background: white; color: var(--primary); }
-        .filter-bar { background: white; padding: 1rem; border-radius: 8px; margin-bottom: 2rem; display: flex; gap: 1rem; flex-wrap: wrap; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .sticky-top { position: sticky; top: 0; z-index: 100; background: var(--light); padding-top: 1rem; }
+        .filter-bar { background: white; padding: 1rem; border-radius: 8px; margin-bottom: 1.25rem; display: flex; gap: 1rem; flex-wrap: wrap; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .time-mode-bar { display: flex; justify-content: center; gap: 0.6rem; flex-wrap: wrap; margin: 0 0 1rem; }
+        .btn-time-mode { background: white; color: var(--primary); border: 2px solid var(--secondary); }
+        .btn-time-mode.active { background: var(--secondary); color: white; }
+        .btn-time-mode:hover { filter: brightness(0.96); }
         .filter-bar label { font-weight: 600; color: var(--primary); white-space: nowrap; display: flex; align-items: center; }
         select { padding: 0.6rem; border: 2px solid var(--border); border-radius: 6px; font-size: 0.9rem; }
         select:focus { outline: none; border-color: var(--secondary); }
@@ -73,6 +78,7 @@
 </head>
 <body>
     <div class="container">
+        <div class="sticky-top">
         <header>
             <h1>Alpha Luxembourg - Social Events Tracker</h1>
             <p class="subtitle">Who's going where? Track all the financial events in town.</p>
@@ -81,6 +87,11 @@
                 <button class="btn-secondary" onclick="exportData()">📥 Export</button>
             </div>
         </header>
+
+        <div class="time-mode-bar" aria-label="Event date filter">
+            <button id="showAllBtn" class="btn-time-mode" onclick="setTimeMode('all')">Show all events</button>
+            <button id="upcomingBtn" class="btn-time-mode active" onclick="setTimeMode('upcoming')">Upcoming events only</button>
+        </div>
 
         <div class="stats">
             <div class="stat">
@@ -117,10 +128,11 @@
                 <option value="Temenos">Temenos</option>
             </select></label>
         </div>
+        </div>
 
         <div id="content"></div>
         <div id="emptyState" class="empty-state" style="display: none;">
-            <p>Aucun événement futur trouvé</p>
+            <p id="emptyStateMessage">Aucun événement à afficher</p>
             <button class="btn-primary" onclick="openAddEventModal()" style="margin-top: 1rem;">Ajouter un événement</button>
         </div>
     </div>
@@ -182,8 +194,28 @@
         let events = [];
         let editingId = null;
         
-        const today = new Date(2026, 8, 30);
-        today.setHours(0, 0, 0, 0);
+        let timeMode = 'upcoming';
+
+        function getToday() {
+            const date = new Date();
+            date.setHours(0, 0, 0, 0);
+            return date;
+        }
+
+        function isUpcomingEvent(dateString) {
+            const eventDate = parseLocalDate(dateString);
+            eventDate.setHours(0, 0, 0, 0);
+            const yesterday = getToday();
+            yesterday.setDate(yesterday.getDate() - 1);
+            return eventDate > yesterday;
+        }
+
+        function setTimeMode(mode) {
+            timeMode = mode;
+            document.getElementById('showAllBtn').classList.toggle('active', mode === 'all');
+            document.getElementById('upcomingBtn').classList.toggle('active', mode === 'upcoming');
+            filterAndRender();
+        }
 
         function parseLocalDate(dateString) {
             const [year, month, day] = dateString.split('-').map(Number);
@@ -220,12 +252,10 @@
             const orgFilter = document.getElementById('orgFilter').value;
             
             let filtered = events.filter(e => {
-                const eDate = parseLocalDate(e.date);
-                eDate.setHours(0, 0, 0, 0);
-                const isFuture = eDate >= today;
+                const dateMatch = timeMode === 'all' || isUpcomingEvent(e.date);
                 const typeMatch = !typeFilter || e.type === typeFilter;
                 const orgMatch = !orgFilter || e.organizer === orgFilter;
-                return isFuture && typeMatch && orgMatch;
+                return dateMatch && typeMatch && orgMatch;
             });
 
             filtered.sort((a, b) => parseLocalDate(a.date) - parseLocalDate(b.date));
@@ -233,6 +263,8 @@
             if (filtered.length === 0) {
                 document.getElementById('content').innerHTML = '';
                 document.getElementById('emptyState').style.display = 'block';
+                document.getElementById('emptyStateMessage').textContent =
+                    timeMode === 'upcoming' ? 'Aucun événement à venir trouvé' : 'Aucun événement trouvé';
                 updateStats();
                 return;
             }
@@ -306,7 +338,7 @@
         function updateStats() {
             document.getElementById('totalEvents').textContent = events.length;
             document.getElementById('totalAttendees').textContent = events.reduce((sum, e) => sum + e.attendees.length, 0);
-            const upcoming = events.filter(e => parseLocalDate(e.date) >= today).length;
+            const upcoming = events.filter(e => isUpcomingEvent(e.date)).length;
             document.getElementById('upcomingCount').textContent = upcoming;
         }
 
