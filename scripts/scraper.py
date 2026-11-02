@@ -12,6 +12,7 @@ Garanties de sécurité des données :
 """
 import argparse
 import hashlib
+import html
 import json
 import logging
 import os
@@ -133,6 +134,83 @@ CONTAINER_SELECTOR = (".event-item, .event-card, .event, .event-listing, .views-
                       ".fusion-post-wrapper, .card, article")
 TITLE_SELECTOR = "h1, h2, h3, h4, .event-title, a.title"
 
+# --------------------------------------------------------------------------- Filtre de pertinence
+# Thème : wealth management, private banking, asset management, asset servicing, private markets.
+# Les mots-clés sont cherchés (sans accents, en minuscules, en mots entiers) dans le titre + le texte
+# de la carte. Le titre pèse plus lourd. Un événement est gardé si score >= MIN_SCORE
+# et qu'aucun mot "hors sujet" ne figure dans le TITRE.
+
+MIN_SCORE = 2
+
+STRONG_KEYWORDS = [  # 2 points dans le texte, 3 dans le titre
+    "wealth management", "wealth manager", "private bank", "private banking", "family office",
+    "family offices", "asset management", "asset manager", "asset managers", "investment management",
+    "investment fund", "investment funds", "fund industry", "fund distribution", "fund services",
+    "asset servicing", "fund administration", "transfer agent", "depositary", "custody", "custodian",
+    "private markets", "private market", "private equity", "private debt", "private credit",
+    "private assets", "venture capital", "infrastructure investment", "real assets", "real estate fund",
+    "alternative investment", "alternatives", "aifm", "aif", "ucits", "sicav", "raif", "ucits",
+    "etf", "etfs", "elte", "eltif", "wealthtech", "portfolio management", "portfolio manager",
+    "limited partners", "general partners", "gp", "lp", "fund manager", "fund managers",
+    "fund finance", "securities services", "management company", "manco", "mancos",
+    "high net worth", "hnwi", "uhnw", "succession planning", "sfdr",
+]
+WEAK_KEYWORDS = [  # 1 point (titre ou texte)
+    "fund", "funds", "investor", "investors", "investment", "investing", "asset", "assets",
+    "wealth", "private", "portfolio", "alternative", "mifid", "dora", "aml", "kyc",
+    "tokenisation", "tokenization", "digital assets", "capital markets", "pension", "institutional",
+    "luxflag", "alfi", "lpea", "abbl", "lsfi",
+]
+EXCLUDE_TITLE = [  # dans le TITRE => rejet (sauf score très élevé)
+    "language learning", "yoga", "padel", "golf", "tennis", "running", "marathon", "wine", "afterwork",
+    "after work", "after-work", "christmas", "xmas", "halloween", "cooking", "cocktail", "networking drinks",
+    "cybersecurity", "cyber security", "hr ", "human resources", "recruitment", "payroll", "tax return",
+    "vat", "customs", "real estate market", "immobilier", "construction", "retail", "tourism", "mobility",
+    "photography", "concert", "exhibition", "kids", "children", "excel", "powerpoint", "management skills",
+    "leadership", "public speaking", "negotiation", "time management", "english", "french lessons",
+    "webinar replay", "newsletter", "job offer",
+]
+
+EXCLUDE_TITLE += [  # communiqués / non-événements / hors thème
+    "appointment", "appoints", "supports", "sponsors", "attends", "factsheet", "episode", "podcast",
+    "transfer pricing", "tp documentation", "defence", "defense", "start your business", "etablir son entreprise",
+    "trade mission", "trade fair", "national pavilion", "delegation", "e-invoicing", "facturation",
+    "cyber", "business plan", "social media", "1031", "wirtschaftsgipfel", "sustainable innovation",
+    "future finance week", "gulf transition", "energy resilience", "data centres",
+]
+# Bonus selon la source : ces organisateurs sont par nature dans le thème.
+SOURCE_BONUS = {"ALFI": 1, "LPEA": 1, "LuxFLAG": 1}
+
+def _compile(words):
+    # le "s?" final accepte les pluriels (investment / investments)
+    return [(w, re.compile(rf"(?<![a-z0-9]){re.escape(w)}s?(?![a-z0-9])")) for w in dict.fromkeys(words)]
+
+_STRONG = _compile(STRONG_KEYWORDS)
+_WEAK = _compile(WEAK_KEYWORDS)
+_EXCL = _compile(EXCLUDE_TITLE)
+
+def relevance(title, text=""):
+    """Renvoie (score, mots_trouvés, motif_exclusion|None)."""
+    t, x = normalize(title), normalize(text)
+    score, found = 0, []
+    for w, rx in _STRONG:
+        if rx.search(t):
+            score += 3; found.append(w)
+        elif rx.search(x):
+            score += 2; found.append(w)
+    for w, rx in _WEAK:
+        if rx.search(t) or rx.search(x):
+            score += 1; found.append(w)
+    excl = next((w for w, rx in _EXCL if rx.search(t)), None)
+    return score, found, excl
+
+def is_relevant(title, text="", bonus=0):
+    score, _, excl = relevance(title, text)
+    score += bonus
+    if excl and score < MIN_SCORE + 4:     # exclusion, sauf si thème très fortement présent
+        return False
+    return score >= MIN_SCORE
+
 def good_title(t):
     n = normalize(t)
     return len(t) >= 8 and len(t) <= 200 and n not in BLACKLIST and not n.startswith("skip to")
@@ -167,7 +245,8 @@ def extract_jsonld(soup, base_url):
             loc = ev.get("location")
             loc_name = loc.get("name") if isinstance(loc, dict) else (loc if isinstance(loc, str) else None)
             out.append({"title": title, "date": iso, "time": tm.group(1) if tm else None,
-                        "location": loc_name, "url": urljoin(base_url, ev.get("url") or base_url)})
+                        "location": loc_name, "url": urljoin(base_url, ev.get("url") or base_url),
+                        "text": f"{ev.get('description') or ''} {ev.get('about') or ''}"})
     return out
 
 def extract_html(soup, base_url):
@@ -191,7 +270,7 @@ def extract_html(soup, base_url):
         tm = re.search(r"\b([01]?\d|2[0-3])[:h]([0-5]\d)\b", text)
         out.append({"title": title, "date": iso,
                     "time": f"{int(tm.group(1)):02d}:{tm.group(2)}" if tm else None,
-                    "location": None, "url": url})
+                    "location": None, "url": url, "text": text})
     return out
 
 def scrape_source(url, organizer, default_type="conference", session=None):
@@ -208,12 +287,18 @@ def scrape_source(url, organizer, default_type="conference", session=None):
         log.warning("%s: erreur (%s)", organizer, e)
         return []
 
-    events, seen = [], set()
+    events, seen, rejected = [], set(), []
     for r in raw:
         k = event_key(organizer, r["title"])
         if k in seen:
             continue
         seen.add(k)
+        r["title"] = html.unescape(r["title"]).replace("​", "").strip()
+        if r["date"] < date.today().isoformat():      # événement passé
+            continue
+        if not is_relevant(r["title"], html.unescape(r.get("text", "")), SOURCE_BONUS.get(organizer, 0)):
+            rejected.append(r["title"])
+            continue
         events.append({
             "id": stable_id(organizer, r["title"]),
             "title": r["title"],
@@ -225,7 +310,9 @@ def scrape_source(url, organizer, default_type="conference", session=None):
             "url": r["url"],
             "attendees": [],
         })
-    log.info("%s: %d événement(s) daté(s)", organizer, len(events))
+    log.info("%s: %d retenu(s), %d hors thème", organizer, len(events), len(rejected))
+    for t in rejected:
+        log.debug("  rejeté: %s", t)
     return events
 
 # --------------------------------------------------------------------------- Sources
@@ -349,16 +436,25 @@ def save_to_jsonbin(events):
 # --------------------------------------------------------------------------- Main
 
 def collect_new_events():
-    allev = []
+    """Scrape toutes les sources puis dédoublonne entre sources (même titre sans l'année + même date).
+    L'ordre de SOURCES fait foi : la source la plus spécialisée (ex. ALFI) est gardée."""
+    allev, seen = [], set()
     for url, org, typ in SOURCES:
-        allev.extend(scrape_source(url, org, typ))
+        for e in scrape_source(url, org, typ):
+            k = (re.sub(r"\b20\d{2}\b", "", normalize(e["title"])).strip(), e["date"])
+            if k in seen:
+                continue
+            seen.add(k)
+            allev.append(e)
     return allev
 
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="ne rien écrire sur JSONBin")
+    ap.add_argument("--verbose", action="store_true", help="affiche aussi les événements rejetés")
     args = ap.parse_args(argv)
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(levelname)s %(message)s")
 
     have_creds = bool(BIN_ID and API_KEY)
     if not have_creds and not args.dry_run:
