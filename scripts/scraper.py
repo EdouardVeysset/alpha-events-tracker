@@ -21,20 +21,16 @@ def fetch_existing_events():
 
 def extract_date_from_text(text):
     """Tente de trouver une vraie date (2026, 2027, 2028) dans le texte de l'événement"""
-    # Cherche un format AAAA-MM-JJ
     match_iso = re.search(r'(202[6-8]-\d{2}-\d{2})', text)
     if match_iso:
         return match_iso.group(1)
     
-    # Cherche un format JJ/MM/AAAA ou JJ-MM-AAAA
     match_slash = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](202[6-8])', text)
     if match_slash:
         day, month, year = match_slash.group(1).zfill(2), match_slash.group(2).zfill(2), match_slash.group(3)
         return f"{year}-{month}-{day}"
         
     return None
-
-# --- FONCTIONS SPÉCIFIQUES EXISTANTES ---
 
 def scrape_alfi():
     events = []
@@ -49,7 +45,7 @@ def scrape_alfi():
                     title = title_el.text.strip()
                     event_date = extract_date_from_text(full_text)
                     if not event_date:
-                        continue # Ignore si aucune date valide n'est trouvée
+                        continue
                         
                     events.append({
                         "id": abs(hash(title)) % 1000000,
@@ -125,8 +121,6 @@ def scrape_lpea():
         print(f"Erreur LPEA: {e}")
     return events
 
-# --- FONCTION GÉNÉRIQUE EXTENSIVE AVEC EXTRACTION DE DATE ---
-
 def scrape_generic(url, organizer_name, default_type="conference"):
     events = []
     try:
@@ -140,10 +134,9 @@ def scrape_generic(url, organizer_name, default_type="conference"):
                 if title_el and len(title_el.text.strip()) > 5:
                     title = title_el.text.strip()
                     
-                    # Extraction automatique de la date depuis le texte de l'élément
                     event_date = extract_date_from_text(full_text)
                     if not event_date:
-                        continue # Ignore l'événement si aucune date n'est trouvée
+                        continue
                     
                     link_el = item.select_one('a')
                     event_url = link_el['href'] if link_el and link_el.has_attr('href') else url
@@ -167,7 +160,6 @@ def scrape_generic(url, organizer_name, default_type="conference"):
     return events
 
 def merge_events(existing, new_ones):
-    """Fusionne intelligemment sans écraser les listes 'attendees' des collaborateurs"""
     map_events = {e['id']: e for e in existing}
     
     for new_e in new_ones:
@@ -199,12 +191,10 @@ if __name__ == "__main__":
     
     all_new_events = []
     
-    # 1. Scrapers spécifiques
     all_new_events.extend(scrape_alfi())
     all_new_events.extend(scrape_abbl())
     all_new_events.extend(scrape_lpea())
     
-    # 2. Sources étendues
     extended_sources = [
         ("https://www.bcc.lu/events/upcoming-events/", "BCC", "forum"),
         ("https://www.amcham.lu/events/", "AMCHAM", "forum"),
@@ -216,4 +206,31 @@ if __name__ == "__main__":
         ("https://www.luxembourgforfinance.com/en/events/upcoming-events/", "Luxembourg for Finance", "forum"),
         ("https://lsfi.lu/events", "LSFI", "seminar"),
         ("https://luxflag.org/events/", "LuxFLAG", "seminar"),
-        ("https://www.ila.lu/event?tags=%5B4%5D", "
+        ("https://www.ila.lu/event?tags=%5B4%5D", "ILA", "seminar"),
+        ("https://www.hubfinance.com/events", "Hubfinance", "forum"),
+        ("https://creobis.eu/en/", "Creobis", "workshop"),
+        ("https://www.houseoftraining.lu/en_GB/training/planning", "House of Training", "workshop"),
+        ("https://www.arendt.com/training-agenda/", "Arendt Training", "workshop"),
+        ("https://www.arendt.com/news-insights/events/", "Arendt", "seminar"),
+        ("https://elvingerhoss.lu/insights/events", "Elvinger Hoss", "seminar"),
+        ("https://www.atoz.lu/events", "Atoz", "seminar"),
+        ("https://www.ey.com/en_lu/events/location-events", "EY Luxembourg", "seminar"),
+        ("https://www.pwc.lu/en/events.html", "PwC", "seminar"),
+        ("https://kpmg.com/lu/en/home/events.html", "KPMG", "seminar"),
+        ("https://www2.deloitte.com/lu/en/events/events.html", "Deloitte", "seminar"),
+        ("https://www.grantthornton.lu/en/events/", "Grant Thornton", "seminar"),
+        ("https://www.jtcgroup.com/events/", "JTC", "seminar"),
+        ("https://lhoft.com/events/", "LHoFT", "workshop"),
+        ("https://finologee.com/news/", "Finologee", "forum"),
+        ("https://www.luxse.com/resources/events", "LuxSE", "forum"),
+    ]
+    
+    for url, org, dtype in extended_sources:
+        all_new_events.extend(scrape_generic(url, org, dtype))
+    
+    if all_new_events:
+        final_events = merge_events(existing, all_new_events)
+        save_to_jsonbin(final_events)
+        print(f"Synchronisation globale terminée. Total événements gérés : {len(final_events)}")
+    else:
+        print("Aucun événement valide récupéré.")
