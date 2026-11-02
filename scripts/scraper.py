@@ -1,230 +1,400 @@
+"""
+Scraper d'événements (Luxembourg finance) -> JSONBin.
+
+Garanties de sécurité des données :
+  * Si la lecture de JSONBin échoue, on ABANDONNE (on n'écrase jamais le bin).
+  * Aucun événement existant n'est supprimé ; les inscriptions (`attendees`) sont conservées.
+  * Les anciens événements (IDs instables issus de hash()) sont rapprochés des nouveaux
+    par (organisateur, titre normalisé) et gardent leur ancien ID.
+  * Une sauvegarde locale du bin est écrite avant chaque mise à jour.
+  * Vérification finale avant écriture : aucun ID perdu, aucune inscription perdue.
+  * Sans JSONBIN_* ou avec --dry-run : aucune écriture.
+"""
+import argparse
+import hashlib
+import json
+import logging
 import os
 import re
+import sys
+import unicodedata
+from datetime import date, datetime
+from urllib.parse import urljoin
+
 import requests
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-BIN_ID = os.environ.get('JSONBIN_BIN_ID')
-API_KEY = os.environ.get('JSONBIN_API_KEY')
-HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+BIN_ID = os.environ.get("JSONBIN_BIN_ID")
+API_KEY = os.environ.get("JSONBIN_API_KEY")
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+TIMEOUT = 15
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "backups")
 
-def fetch_existing_events():
-    """Récupère les événements actuels depuis JSONBin"""
-    url = f"https://api.jsonbin.io/v3/b/{BIN_ID}/latest"
-    headers = {'X-Master-Key': API_KEY}
+log = logging.getLogger("scraper")
+
+# --------------------------------------------------------------------------- HTTP
+
+def make_session():
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=(429, 500, 502, 503, 504),
+                  allowed_methods=("GET", "PUT"))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    s.headers.update(HEADERS)
+    return s
+
+SESSION = make_session()
+
+# --------------------------------------------------------------------------- Dates
+
+MONTHS = {
+    "january": 1, "jan": 1, "janvier": 1, "janv": 1,
+    "february": 2, "feb": 2, "février": 2, "fevrier": 2, "févr": 2, "fév": 2,
+    "march": 3, "mar": 3, "mars": 3,
+    "april": 4, "apr": 4, "avril": 4, "avr": 4,
+    "may": 5, "mai": 5,
+    "june": 6, "jun": 6, "juin": 6,
+    "july": 7, "jul": 7, "juillet": 7, "juil": 7,
+    "august": 8, "aug": 8, "août": 8, "aout": 8,
+    "september": 9, "sep": 9, "sept": 9, "septembre": 9,
+    "october": 10, "oct": 10, "octobre": 10,
+    "november": 11, "nov": 11, "novembre": 11,
+    "december": 12, "dec": 12, "décembre": 12, "decembre": 12, "déc": 12,
+}
+_MONTH_RE = "|".join(sorted((re.escape(m) for m in MONTHS), key=len, reverse=True))
+_YEAR = r"(20\d{2})"
+
+def _valid(y, m, d):
     try:
-        response = requests.get(url, headers=headers)
-        if response.status_code == 200:
-            return response.json().get('record', [])
-    except Exception as e:
-        print(f"Erreur lors de la récupération JSONBin: {e}")
-    return []
+        datetime(int(y), int(m), int(d))
+    except ValueError:
+        return None
+    return f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
 
-def extract_date_from_text(text):
-    """Tente de trouver une vraie date (2026, 2027, 2028) dans le texte de l'événement"""
-    match_iso = re.search(r'(202[6-8]-\d{2}-\d{2})', text)
-    if match_iso:
-        return match_iso.group(1)
-    
-    match_slash = re.search(r'(\d{1,2})[/-](\d{1,2})[/-](202[6-8])', text)
-    if match_slash:
-        day, month, year = match_slash.group(1).zfill(2), match_slash.group(2).zfill(2), match_slash.group(3)
-        return f"{year}-{month}-{day}"
-        
+def extract_date_from_text(text, today=None):
+    """Renvoie une date ISO 'YYYY-MM-DD' ou None. N'invente JAMAIS de date.
+    Formats : 2026-11-04, 04/11/2026, 4.11.2026, 4 November 2026, 4th Nov 2026,
+    November 4, 2026, 4 novembre 2026. Année limitée à [année-1, année+3]."""
+    if not text:
+        return None
+    today = today or date.today()
+    lo, hi = today.year - 1, today.year + 3
+    t = text.replace("\xa0", " ")
+
+    def ok(iso):
+        return iso if iso and lo <= int(iso[:4]) <= hi else None
+
+    m = re.search(rf"\b{_YEAR}-(\d{{2}})-(\d{{2}})\b", t)
+    if m and ok(_valid(m.group(1), m.group(2), m.group(3))):
+        return _valid(m.group(1), m.group(2), m.group(3))
+
+    for m in re.finditer(rf"\b(\d{{1,2}})[/.\-](\d{{1,2}})[/.\-]{_YEAR}\b", t):
+        iso = ok(_valid(m.group(3), m.group(2), m.group(1)))   # jj/mm/aaaa (convention européenne)
+        if iso:
+            return iso
+
+    for m in re.finditer(rf"\b(\d{{1,2}})(?:st|nd|rd|th|er)?\s+(?:of\s+)?({_MONTH_RE})\.?,?\s+{_YEAR}\b", t, re.I):
+        iso = ok(_valid(m.group(3), MONTHS[m.group(2).lower()], m.group(1)))
+        if iso:
+            return iso
+
+    for m in re.finditer(rf"\b({_MONTH_RE})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+{_YEAR}\b", t, re.I):
+        iso = ok(_valid(m.group(3), MONTHS[m.group(1).lower()], m.group(2)))
+        if iso:
+            return iso
     return None
 
-def scrape_alfi():
-    events = []
+# --------------------------------------------------------------------------- Identité
+
+def normalize(s):
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+def event_key(organizer, title):
+    return f"{normalize(organizer)}|{normalize(title)}"
+
+def stable_id(organizer, title):
+    """ID déterministe (contrairement à hash(), randomisé à chaque exécution Python).
+    Ne dépend PAS de la date, pour que l'ID survive à un changement de date."""
+    h = hashlib.sha1(event_key(organizer, title).encode()).hexdigest()
+    return int(h[:12], 16) % 1_000_000_000
+
+# --------------------------------------------------------------------------- Extraction
+
+BLACKLIST = {
+    "contact", "login", "register", "login register", "skip to content", "recherche", "rechercher",
+    "search", "subscribe to our newsletter", "newsletter", "read more", "learn more", "en savoir plus",
+    "see all", "view all", "events", "evenements", "agenda", "menu", "home", "accueil", "cookies",
+    "privacy policy", "terms and conditions", "list your security", "market overview", "language learning",
+}
+CONTAINER_SELECTOR = (".event-item, .event-card, .event, .event-listing, .views-row, "
+                      ".fusion-post-wrapper, .card, article")
+TITLE_SELECTOR = "h1, h2, h3, h4, .event-title, a.title"
+
+def good_title(t):
+    n = normalize(t)
+    return len(t) >= 8 and len(t) <= 200 and n not in BLACKLIST and not n.startswith("skip to")
+
+def _walk_jsonld(node):
+    if isinstance(node, list):
+        for n in node:
+            yield from _walk_jsonld(n)
+    elif isinstance(node, dict):
+        t = node.get("@type")
+        types = t if isinstance(t, list) else [t]
+        if any(isinstance(x, str) and x.endswith("Event") for x in types):
+            yield node
+        for v in node.values():
+            if isinstance(v, (list, dict)):
+                yield from _walk_jsonld(v)
+
+def extract_jsonld(soup, base_url):
+    out = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or tag.get_text() or "")
+        except (ValueError, TypeError):
+            continue
+        for ev in _walk_jsonld(data):
+            title = (ev.get("name") or "").strip()
+            start = str(ev.get("startDate") or "")
+            iso = extract_date_from_text(start[:10]) if start else None
+            if not (title and iso and good_title(title)):
+                continue
+            tm = re.search(r"T(\d{2}:\d{2})", start)
+            loc = ev.get("location")
+            loc_name = loc.get("name") if isinstance(loc, dict) else (loc if isinstance(loc, str) else None)
+            out.append({"title": title, "date": iso, "time": tm.group(1) if tm else None,
+                        "location": loc_name, "url": urljoin(base_url, ev.get("url") or base_url)})
+    return out
+
+def extract_html(soup, base_url):
+    out = []
+    for item in soup.select(CONTAINER_SELECTOR):
+        text = item.get_text(" ", strip=True)
+        if len(text) > 1500:          # conteneur géant = probablement toute la page
+            continue
+        iso = extract_date_from_text(text)
+        if not iso:                    # pas de vraie date -> pas d'événement
+            continue
+        title_el = item.select_one(TITLE_SELECTOR) or item.select_one("a")
+        if not title_el:
+            continue
+        title = title_el.get_text(" ", strip=True)
+        if not good_title(title):
+            continue
+        link = title_el if title_el.name == "a" else (title_el.find("a") or item.select_one("a"))
+        href = link.get("href") if link is not None and link.has_attr("href") else None
+        url = urljoin(base_url, href) if href and not href.startswith(("#", "javascript:", "mailto:")) else base_url
+        tm = re.search(r"\b([01]?\d|2[0-3])[:h]([0-5]\d)\b", text)
+        out.append({"title": title, "date": iso,
+                    "time": f"{int(tm.group(1)):02d}:{tm.group(2)}" if tm else None,
+                    "location": None, "url": url})
+    return out
+
+def scrape_source(url, organizer, default_type="conference", session=None):
+    """Scrape générique : JSON-LD d'abord, HTML ensuite. Ne renvoie que des événements datés."""
+    session = session or SESSION
     try:
-        res = requests.get("https://www.alfi.lu/events", headers=HEADERS, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for item in soup.select('.event-item, .card, article'):
-                full_text = item.get_text(" ", strip=True)
-                title_el = item.select_one('h2, h3, a.title')
-                if title_el:
-                    title = title_el.text.strip()
-                    event_date = extract_date_from_text(full_text) or "2027-06-15"
-                        
-                    events.append({
-                        "id": abs(hash(title)) % 1000000,
-                        "title": title,
-                        "type": "conference",
-                        "date": event_date,
-                        "time": "09:00",
-                        "location": "Luxembourg",
-                        "organizer": "ALFI",
-                        "url": "https://www.alfi.lu",
-                        "attendees": []
-                    })
+        res = session.get(url, timeout=TIMEOUT)
+        if res.status_code != 200:
+            log.warning("%s: HTTP %s (%s)", organizer, res.status_code, url)
+            return []
+        soup = BeautifulSoup(res.text, "html.parser")
+        raw = extract_jsonld(soup, res.url) or extract_html(soup, res.url)
     except Exception as e:
-        print(f"Erreur ALFI: {e}")
+        log.warning("%s: erreur (%s)", organizer, e)
+        return []
+
+    events, seen = [], set()
+    for r in raw:
+        k = event_key(organizer, r["title"])
+        if k in seen:
+            continue
+        seen.add(k)
+        events.append({
+            "id": stable_id(organizer, r["title"]),
+            "title": r["title"],
+            "type": default_type,
+            "date": r["date"],
+            "time": r["time"] or "09:00",
+            "location": r["location"] or "Luxembourg",
+            "organizer": organizer,
+            "url": r["url"],
+            "attendees": [],
+        })
+    log.info("%s: %d événement(s) daté(s)", organizer, len(events))
     return events
 
-def scrape_abbl():
-    events = []
-    try:
-        res = requests.get("https://abbl.lu/en/home/events", headers=HEADERS, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for item in soup.select('.event-card, .views-row'):
-                full_text = item.get_text(" ", strip=True)
-                title_el = item.select_one('h3, h2, a')
-                if title_el and len(title_el.text.strip()) > 5:
-                    title = title_el.text.strip()
-                    event_date = extract_date_from_text(full_text) or "2027-06-15"
-                        
-                    events.append({
-                        "id": abs(hash(title)) % 1000000,
-                        "title": title,
-                        "type": "seminar",
-                        "date": event_date,
-                        "time": "09:00",
-                        "location": "Luxembourg",
-                        "organizer": "ABBL",
-                        "url": "https://abbl.lu",
-                        "attendees": []
-                    })
-    except Exception as e:
-        print(f"Erreur ABBL: {e}")
-    return events
+# --------------------------------------------------------------------------- Sources
 
-def scrape_lpea():
-    events = []
-    try:
-        res = requests.get("https://lpea.lu/events/", headers=HEADERS, timeout=10)
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for item in soup.select('.event, article, .fusion-post-wrapper'):
-                full_text = item.get_text(" ", strip=True)
-                title_el = item.select_one('h2, h3, a')
-                if title_el and len(title_el.text.strip()) > 5:
-                    title = title_el.text.strip()
-                    event_date = extract_date_from_text(full_text) or "2027-06-15"
-                        
-                    events.append({
-                        "id": abs(hash(title)) % 1000000,
-                        "title": title,
-                        "type": "conference",
-                        "date": event_date,
-                        "time": "09:00",
-                        "location": "Luxembourg",
-                        "organizer": "LPEA",
-                        "url": "https://lpea.lu",
-                        "attendees": []
-                    })
-    except Exception as e:
-        print(f"Erreur LPEA: {e}")
-    return events
+SOURCES = [
+    ("https://www.alfi.lu/events", "ALFI", "conference"),
+    ("https://www.abbl.lu/en/home/events", "ABBL", "seminar"),
+    ("https://lpea.lu/events/", "LPEA", "conference"),
+    ("https://www.bcc.lu/events/upcoming-events/", "BCC", "forum"),
+    ("https://www.amcham.lu/events/", "AMCHAM", "forum"),
+    ("https://paperjam.lu/club/agenda", "Paperjam Club", "forum"),
+    ("https://www.cc.lu/agenda", "Chambre de Commerce", "seminar"),
+    ("https://romlux.org/romlux-events/", "Romlux", "forum"),
+    ("https://100women.org/events/", "100 Women in Finance", "conference"),
+    ("https://www.futureoffinance.biz/upcoming-events", "Future of Finance", "conference"),
+    ("https://www.luxembourgforfinance.com/en/events/upcoming-events/", "Luxembourg for Finance", "forum"),
+    ("https://lsfi.lu/events", "LSFI", "seminar"),
+    ("https://luxflag.org/events/", "LuxFLAG", "seminar"),
+    ("https://www.ila.lu/event?tags=%5B4%5D", "ILA", "seminar"),
+    ("https://www.hubfinance.com/events", "Hubfinance", "forum"),
+    ("https://creobis.eu/en/", "Creobis", "workshop"),
+    ("https://www.houseoftraining.lu/en_GB/training/planning", "House of Training", "workshop"),
+    ("https://www.arendt.com/training-agenda/", "Arendt Training", "workshop"),
+    ("https://www.arendt.com/news-insights/events/", "Arendt", "seminar"),
+    ("https://elvingerhoss.lu/insights/events", "Elvinger Hoss", "seminar"),
+    ("https://www.atoz.lu/events", "Atoz", "seminar"),
+    ("https://www.ey.com/en_lu/events/location-events", "EY Luxembourg", "seminar"),
+    ("https://www.pwc.lu/en/events.html", "PwC", "seminar"),
+    ("https://kpmg.com/lu/en/home/events.html", "KPMG", "seminar"),
+    ("https://www2.deloitte.com/lu/en/events/events.html", "Deloitte", "seminar"),
+    ("https://www.grantthornton.lu/en/events/", "Grant Thornton", "seminar"),
+    ("https://www.jtcgroup.com/events/", "JTC", "seminar"),
+    ("https://lhoft.com/events/", "LHoFT", "workshop"),
+    ("https://finologee.com/news/", "Finologee", "forum"),
+    ("https://www.luxse.com/resources/events", "LuxSE", "forum"),
+]
 
-def scrape_generic(url, organizer_name, default_type="conference"):
-    events = []
-    try:
-        res = requests.get(url, headers=HEADERS, timeout=10)
-        print(f"Test {organizer_name} - Status HTTP: {res.status_code}")
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            for item in soup.select('.event-item, .card, article, .views-row, .fusion-post-wrapper, .event-listing, li, div'):
-                full_text = item.get_text(" ", strip=True)
-                title_el = item.select_one('h2, h3, a.title, .event-title, a')
-                
-                if title_el and len(title_el.text.strip()) > 5:
-                    title = title_el.text.strip()
-                    
-                    event_date = extract_date_from_text(full_text) or "2027-06-15"
-                    
-                    link_el = item.select_one('a')
-                    event_url = link_el['href'] if link_el and link_el.has_attr('href') else url
-                    if event_url.startswith('/'):
-                        base_domain = "/".join(url.split("/")[:3])
-                        event_url = base_domain + event_url
-
-                    events.append({
-                        "id": abs(hash(title)) % 1000000,
-                        "title": title,
-                        "type": default_type,
-                        "date": event_date,
-                        "time": "09:00",
-                        "location": "Luxembourg",
-                        "organizer": organizer_name,
-                        "url": event_url,
-                        "attendees": []
-                    })
-    except Exception as e:
-        print(f"Erreur scraping {organizer_name}: {e}")
-    return events
+# --------------------------------------------------------------------------- Fusion
 
 def merge_events(existing, new_ones):
-    map_events = {e['id']: e for e in existing}
-    
-    for new_e in new_ones:
-        if new_e['id'] in map_events:
-            current_attendees = map_events[new_e['id']].get('attendees', [])
-            map_events[new_e['id']].update(new_e)
-            if current_attendees:
-                map_events[new_e['id']]['attendees'] = current_attendees
-        else:
-            map_events[new_e['id']] = new_e
-            
-    return list(map_events.values())
+    """Fusionne sans RIEN perdre.
+    - Tous les événements existants sont conservés tels quels (autres champs, attendees…).
+    - Un nouvel événement est rapproché d'un existant par ID, sinon par (organisateur, titre).
+      L'ID existant et les `attendees` existants sont toujours conservés.
+    - Pour un événement rapproché, on met à jour date/heure/url/titre uniquement si le scraping
+      a trouvé une vraie valeur ; on ne remplace pas un champ existant par du vide."""
+    merged = [dict(e) for e in existing]
+    by_id = {e.get("id"): e for e in merged if "id" in e}
+    by_key = {}
+    for e in merged:
+        if e.get("organizer") and e.get("title"):
+            by_key.setdefault(event_key(e["organizer"], e["title"]), e)
+
+    added = updated = 0
+    for n in new_ones:
+        target = by_id.get(n["id"]) or by_key.get(event_key(n["organizer"], n["title"]))
+        if target is None:
+            n = dict(n)
+            merged.append(n)
+            by_id[n["id"]] = n
+            by_key[event_key(n["organizer"], n["title"])] = n
+            added += 1
+            continue
+        changed = False
+        for field in ("title", "date", "time", "url"):
+            if n.get(field) and target.get(field) != n[field]:
+                target[field] = n[field]
+                changed = True
+        target.setdefault("attendees", [])   # jamais écrasé
+        updated += changed
+    log.info("Fusion: %d ajouté(s), %d mis à jour, %d conservé(s) tels quels",
+             added, updated, len(merged) - added - updated)
+    return merged
+
+def check_no_loss(existing, final):
+    """Garde-fou : lève une erreur si un événement ou une inscription a disparu."""
+    final_by_id = {e.get("id"): e for e in final}
+    for e in existing:
+        f = final_by_id.get(e.get("id"))
+        if f is None:
+            raise RuntimeError(f"Événement perdu: {e.get('id')} {e.get('title')!r}")
+        old_att = e.get("attendees") or []
+        new_att = f.get("attendees") or []
+        if any(a not in new_att for a in old_att):
+            raise RuntimeError(f"Inscriptions perdues pour {e.get('title')!r}")
+
+# --------------------------------------------------------------------------- JSONBin
+
+class JsonBinError(RuntimeError):
+    pass
+
+def fetch_existing_events():
+    """Renvoie la liste existante. LÈVE une exception si la lecture échoue (jamais [] par défaut)."""
+    url = f"https://api.jsonbin.io/v3/b/{BIN_ID}/latest"
+    try:
+        r = SESSION.get(url, headers={"X-Master-Key": API_KEY}, timeout=TIMEOUT)
+    except requests.RequestException as e:
+        raise JsonBinError(f"Lecture JSONBin impossible: {e}") from e
+    if r.status_code != 200:
+        raise JsonBinError(f"Lecture JSONBin: HTTP {r.status_code} {r.text[:200]}")
+    record = r.json().get("record")
+    if not isinstance(record, list):
+        raise JsonBinError(f"Format inattendu du bin (type {type(record).__name__}); abandon.")
+    return record
+
+def backup(events):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    path = os.path.join(BACKUP_DIR, f"events_{datetime.now():%Y%m%d_%H%M%S}.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(events, f, ensure_ascii=False, indent=2)
+    return path
 
 def save_to_jsonbin(events):
     url = f"https://api.jsonbin.io/v3/b/{BIN_ID}"
-    headers = {
-        'Content-Type': 'application/json',
-        'X-Master-Key': API_KEY
-    }
-    response = requests.put(url, headers=headers, json=events)
-    if response.status_code == 200:
-        print("Mise à jour réussie sur JSONBin !")
+    r = SESSION.put(url, headers={"Content-Type": "application/json", "X-Master-Key": API_KEY},
+                    json=events, timeout=TIMEOUT)
+    if r.status_code != 200:
+        raise JsonBinError(f"Erreur sauvegarde: HTTP {r.status_code} {r.text[:200]}")
+    log.info("Mise à jour réussie sur JSONBin (%d événements).", len(events))
+
+# --------------------------------------------------------------------------- Main
+
+def collect_new_events():
+    allev = []
+    for url, org, typ in SOURCES:
+        allev.extend(scrape_source(url, org, typ))
+    return allev
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="ne rien écrire sur JSONBin")
+    args = ap.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+
+    have_creds = bool(BIN_ID and API_KEY)
+    if not have_creds and not args.dry_run:
+        log.error("JSONBIN_BIN_ID / JSONBIN_API_KEY manquants (utilisez --dry-run pour tester).")
+        return 2
+
+    existing = []
+    if have_creds:
+        try:
+            existing = fetch_existing_events()
+        except JsonBinError as e:
+            log.error("%s -> ABANDON, rien n'est modifié.", e)
+            return 1
+        log.info("%d événement(s) existant(s) dans le bin.", len(existing))
     else:
-        print(f"Erreur sauvegarde: {response.text}")
+        log.warning("Pas d'identifiants: dry-run sur un bin vide.")
+
+    new_events = collect_new_events()
+    if not new_events:
+        log.warning("Aucun événement valide récupéré; bin inchangé.")
+        return 0
+
+    final = merge_events(existing, new_events)
+    check_no_loss(existing, final)
+
+    if args.dry_run or not have_creds:
+        log.info("DRY-RUN: %d événements au total, aucune écriture.", len(final))
+        return 0
+
+    log.info("Sauvegarde locale: %s", backup(existing))
+    try:
+        save_to_jsonbin(final)
+    except JsonBinError as e:
+        log.error("%s", e)
+        return 1
+    return 0
 
 if __name__ == "__main__":
-    print("Démarrage du scraping multi-sources global...")
-    existing = fetch_existing_events()
-    
-    all_new_events = []
-    
-    all_new_events.extend(scrape_alfi())
-    all_new_events.extend(scrape_abbl())
-    all_new_events.extend(scrape_lpea())
-    
-    extended_sources = [
-        ("https://www.bcc.lu/events/upcoming-events/", "BCC", "forum"),
-        ("https://www.amcham.lu/events/", "AMCHAM", "forum"),
-        ("https://paperjam.lu/club/agenda", "Paperjam Club", "forum"),
-        ("https://www.cc.lu/agenda", "Chambre de Commerce", "seminar"),
-        ("https://romlux.org/romlux-events/", "Romlux", "forum"),
-        ("https://100women.org/events/", "100 Women in Finance", "conference"),
-        ("https://www.futureoffinance.biz/upcoming-events", "Future of Finance", "conference"),
-        ("https://www.luxembourgforfinance.com/en/events/upcoming-events/", "Luxembourg for Finance", "forum"),
-        ("https://lsfi.lu/events", "LSFI", "seminar"),
-        ("https://luxflag.org/events/", "LuxFLAG", "seminar"),
-        ("https://www.ila.lu/event?tags=%5B4%5D", "ILA", "seminar"),
-        ("https://www.hubfinance.com/events", "Hubfinance", "forum"),
-        ("https://creobis.eu/en/", "Creobis", "workshop"),
-        ("https://www.houseoftraining.lu/en_GB/training/planning", "House of Training", "workshop"),
-        ("https://www.arendt.com/training-agenda/", "Arendt Training", "workshop"),
-        ("https://www.arendt.com/news-insights/events/", "Arendt", "seminar"),
-        ("https://elvingerhoss.lu/insights/events", "Elvinger Hoss", "seminar"),
-        ("https://www.atoz.lu/events", "Atoz", "seminar"),
-        ("https://www.ey.com/en_lu/events/location-events", "EY Luxembourg", "seminar"),
-        ("https://www.pwc.lu/en/events.html", "PwC", "seminar"),
-        ("https://kpmg.com/lu/en/home/events.html", "KPMG", "seminar"),
-        ("https://www2.deloitte.com/lu/en/events/events.html", "Deloitte", "seminar"),
-        ("https://www.grantthornton.lu/en/events/", "Grant Thornton", "seminar"),
-        ("https://www.jtcgroup.com/events/", "JTC", "seminar"),
-        ("https://lhoft.com/events/", "LHoFT", "workshop"),
-        ("https://finologee.com/news/", "Finologee", "forum"),
-        ("https://www.luxse.com/resources/events", "LuxSE", "forum"),
-    ]
-    
-    for url, org, dtype in extended_sources:
-        all_new_events.extend(scrape_generic(url, org, dtype))
-    
-    if all_new_events:
-        final_events = merge_events(existing, all_new_events)
-        save_to_jsonbin(final_events)
-        print(f"Synchronisation globale terminée. Total événements gérés : {len(final_events)}")
-    else:
-        print("Aucun événement valide récupéré.")
+    sys.exit(main())
