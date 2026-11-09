@@ -215,6 +215,43 @@ def good_title(t):
     n = normalize(t)
     return len(t) >= 8 and len(t) <= 200 and n not in BLACKLIST and not n.startswith("skip to")
 
+
+# Localités explicitement exclues lorsqu'elles apparaissent dans l'intitulé.
+# Le filtre porte uniquement sur le TITRE : une adresse ou une ville citée dans
+# la description ne suffit pas à écarter un événement organisé au Luxembourg.
+# "Luxembourg" et ses variantes sont volontairement absents de cette liste.
+NON_LUXEMBOURG_LOCATIONS = [
+    # Villes européennes fréquemment présentes dans les agendas financiers
+    "Amsterdam", "Athens", "Barcelona", "Barcelone", "Basel", "Berlin", "Brussels",
+    "Bruxelles", "Cannes", "Copenhagen", "Copenhague", "Dublin", "Edinburgh",
+    "Frankfurt", "Francfort", "Geneva", "Genève", "Hamburg", "Helsinki", "Lisbon",
+    "Lisbonne", "London", "Londres", "Madrid", "Milan", "Monaco", "Munich",
+    "München", "Oslo", "Paris", "Prague", "Rome", "Roma", "Stockholm", "Vienna",
+    "Vienne", "Warsaw", "Zug", "Zurich", "Zürich",
+    # Autres places financières et destinations internationales
+    "Abu Dhabi", "Beijing", "Boston", "Chicago", "Dubai", "Dubaï", "Hong Kong",
+    "Istanbul", "Kuala Lumpur", "Miami", "New York", "San Francisco", "Seoul",
+    "Séoul", "Shanghai", "Singapore", "Singapour", "Sydney", "Tokyo", "Toronto",
+    "Washington",
+    # Pays et régions (y compris adjectifs géographiques usuels)
+    "Austria", "Autriche", "Belgium", "Belgique", "China", "Chine", "Denmark",
+    "Danemark", "France", "Germany", "Allemagne", "Greece", "Grèce", "India",
+    "Inde", "Ireland", "Irlande", "Italy", "Italie", "Japan", "Japon",
+    "Netherlands", "Pays Bas", "Poland", "Pologne", "Portugal", "Singapore",
+    "Spain", "Espagne", "Sweden", "Suède", "Switzerland", "Suisse",
+    "United Kingdom", "United States", "USA",
+]
+
+_LOCATION_PATTERNS = [
+    re.compile(rf"(?<![a-z0-9]){re.escape(normalize(name))}(?![a-z0-9])")
+    for name in sorted(set(NON_LUXEMBOURG_LOCATIONS), key=len, reverse=True)
+]
+
+def title_mentions_non_luxembourg_location(title):
+    """True si le titre mentionne une ville ou un pays hors Luxembourg."""
+    normalized_title = normalize(title)
+    return any(pattern.search(normalized_title) for pattern in _LOCATION_PATTERNS)
+
 def _walk_jsonld(node):
     if isinstance(node, list):
         for n in node:
@@ -295,6 +332,11 @@ def scrape_source(url, organizer, default_type="conference", session=None):
         seen.add(k)
         r["title"] = html.unescape(r["title"]).replace("​", "").strip()
         if r["date"] < date.today().isoformat():      # événement passé
+            continue
+        # Exclut les événements dont le titre annonce une destination hors Luxembourg
+        # (ex. "Private Equity Seminar in Miami" ou "Roadshow to Barcelona").
+        if title_mentions_non_luxembourg_location(r["title"]):
+            rejected.append(f"{r['title']} [localité hors Luxembourg]")
             continue
         if not is_relevant(r["title"], html.unescape(r.get("text", "")), SOURCE_BONUS.get(organizer, 0)):
             rejected.append(r["title"])
